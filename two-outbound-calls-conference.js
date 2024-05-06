@@ -8,6 +8,9 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const app = express();
 
+const request = require('request');
+const fs = require('fs');
+
 //--- for VCR (aka Neru) installation ----
 
 const neruHost = process.env.NERU_HOST;
@@ -42,6 +45,14 @@ const options = {
 const { Vonage } = require('@vonage/server-sdk');
 
 const vonage = new Vonage(credentials, options);
+
+//--
+
+const appId = process.env.APP_ID;
+
+const privateKey = fs.readFileSync('./.private.key');
+
+const { tokenGenerate } = require('@vonage/jwt');
 
 //==========================================================
 
@@ -162,12 +173,42 @@ app.post('/event1', (req, res) => {
       event_url: ['https://' + hostName + '/event2?originalUuid=' + uuid],
       event_method: 'POST'
       })
-      .then(res => console.log(`>>> outgoing call 2 to ${number2} status:`, res))
+      .then(res => {
+        console.log(`>>> outgoing call 2 to ${number2} status:`, res);
+        app.set('second_leg_with_' + uuid, res.uuid); // mappind 2nd leg uuid with 1st leg uuid
+        })
+      .catch(err => {
+        console.error(`>>> outgoing call 2 to ${number2} error:`, err);
+        console.error(err.body);
+      });
+  };
+
+  //---------
+
+  if (req.body.status === 'completed') {
+
+    const firstLegUuid = req.body.uuid;
+
+    const secongLegUuid = app.get('second_leg_with_' + firstLegUuid);
+
+    if (secongLegUuid != null) {  // if second leg has started
+
+      vonage.voice.hangupCall(secongLegUuid)  // then terminate second call leg
+        .then(res => console.log('>>> terminated second call leg'))
         .catch(err => {
-          console.error(`>>> outgoing call 2 to ${number2} error:`, err)
-          console.error(err.body);
+          console.error(`>>> terminating second call leg error - zone 1:`, err.response)
+          // you may see error 400 bad request if second leg is already terminated, that's not a problem
         });
-  }
+
+      app.set('second_leg_with_' + firstLegUuid, null); // clear parameter 
+
+    } else {
+
+      console.log('>>> no second leg yet');
+
+    }
+
+  };  
 
 });
 
@@ -198,14 +239,45 @@ app.post('/event2', (req, res) => {
 
     if (req.body.type === 'transfer') {
 
-    const call1Uuid = req.query.originalUuid;  
+      const call1Uuid = req.query.originalUuid;  
 
-    vonage.voice.stopStreamAudio(call1Uuid)
-      .then(res => console.log(`>>> stop streaming ring back tone to call ${call1Uuid} status:`, res))
-      .catch(err => {
-        console.error(`>>> stop streaming ring back tone to call ${call1Uuid} error:`, err)
-        console.error(err.body);
+      vonage.voice.stopStreamAudio(call1Uuid)
+        .then(res => console.log(`>>> stop streaming ring back tone to call ${call1Uuid} status:`, res))
+        .catch(err => {
+          console.error(`>>> stop streaming ring back tone to call ${call1Uuid} error:`, err.response);
+          // console.error(err.body);
+        });
+
+      // test call state of call1Uuid
+
+      const accessToken = tokenGenerate(appId, privateKey, {});
+
+      // see https://nexmoinc.github.io/conversation-service-docs/docs/api/get-legs
+      request.get(apiRegion + '/v1/legs/' + call1Uuid, {
+          headers: {
+              'Authorization': 'Bearer ' + accessToken,
+              "content-type": "application/json",
+          },
+          json: true,
+        }, function (error, response, body) {
+          if (error) {
+            console.log('error get call leg', call1Uuid, 'status:', error);
+          }
+          else {
+            // console.log('get call leg', call1Uuid, ':', response.body.state.status);
+
+            if (response.body.state.status === 'completed') {  // if 1st call leg has terminated
+              vonage.voice.hangupCall(req.body.uuid)          // then terminate second call leg
+                .then(res => console.log('>>> terminated second call leg'))
+                  .catch(err => {
+                    console.error(`>>> terminating second call leg error - zone 2:`, err.response)
+                  });
+              }
+
+            }
+
       });
+
     };
 
 });
