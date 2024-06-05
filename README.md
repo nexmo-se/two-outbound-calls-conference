@@ -5,7 +5,7 @@
 Copy or rename .env-example to .env<br>
 Update parameters in .env file<br>
 
-This application has been tested with Node.js version 16.15<br>
+This application has been tested with Node.js version 18.19.1<br>
 
 Install node modules with the command "npm install"<br>
 
