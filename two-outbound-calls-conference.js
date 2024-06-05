@@ -11,14 +11,14 @@ const app = express();
 const request = require('request');
 const fs = require('fs');
 
-//--- for VCR (aka Neru) installation ----
+//--- for VCR (Vonage Code Runtime - Serverless infra - aka Neru) installation ----
 
 const neruHost = process.env.NERU_HOST;
 console.log('neruHost:', neruHost);
 
 //------------------------------
 
-const serviceNumber = process.env.SERVICE_NUMBER;
+const serviceNumber = process.env.SERVICE_PHONE_NUMBER;
 
 // ------------------
 
@@ -35,8 +35,7 @@ const credentials = new Auth({
   privateKey: './.private.key'    // private key file name with a leading dot 
 });
 
-// sample API endpoint value, set the relevant one for your own application
-const apiRegion = "https://api-us-3.vonage.com";  // must be consistent with the corresponding application's "Region" paremeter value (dashboard.nexmo.com)
+const apiRegion = "https://" + process.env.API_REGION;
 
 const options = {
   apiHost: apiRegion
@@ -48,15 +47,29 @@ const vonage = new Vonage(credentials, options);
 
 //--
 
+const vonageNr = new Vonage(credentials, {} ); 
 const appId = process.env.APP_ID;
+const apiBaseUrl = "https://api-us.vonage.com";
 
 const privateKey = fs.readFileSync('./.private.key');
 
 const { tokenGenerate } = require('@vonage/jwt');
 
-//==========================================================
+//---- CORS policy - Update this section as needed ----
+
+app.use(function (req, res, next) {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept");
+  res.header("Access-Control-Allow-Methods", "OPTIONS,GET,POST,PUT,DELETE");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With");
+  next();
+});
+
+//---
 
 app.use(bodyParser.json());
+
+//==========================================================
 
 //--- test making calls from a local request
 // corresponds to a HTTP GET request
@@ -92,6 +105,12 @@ app.get('/call2numbers', (req, res) => {
      type: 'phone',
      number: serviceNumber
     },
+    advanced_machine_detection: {
+      "behavior": "continue",
+      "mode": "default",  // use this value for the latest AMD implementation
+      "beep_timeout": 45
+    },
+    ringing_timer: 70,
     answer_url: ['https://' + hostName + '/answer1?number2=' + number2],
     answer_method: 'GET',
     event_url: ['https://' + hostName + '/event1?number2=' + number2],
@@ -107,7 +126,7 @@ app.get('/call2numbers', (req, res) => {
 
 //----
 
-app.get('/answer1', (req, res) => {
+app.get('/answer1', (req, res) => { 
 
     //-- play an announcement, then put call 1 into a named conference --
 
@@ -130,11 +149,11 @@ app.get('/answer1', (req, res) => {
 
 //--------
 
-app.post('/event1', (req, res) => {
+app.post('/event1', async (req, res) => {
 
   res.status(200).send('Ok');
 
-  if (req.body.type === 'transfer') {
+  if (req.body.type == 'transfer') {
 
     let hostName;
 
@@ -168,9 +187,15 @@ app.post('/event1', (req, res) => {
        type: 'phone',
        number: serviceNumber
       },
-      answer_url: ['https://' + hostName + '/answer2?originalUuid=' + uuid],
+    advanced_machine_detection: {
+      "behavior": "continue",
+      "mode": "default",  // use this value for the latest AMD implementation
+      "beep_timeout": 45
+    },
+    ringing_timer: 70,
+      answer_url: ['https://' + hostName + '/answer2?original_uuid=' + uuid],
       answer_method: 'GET',
-      event_url: ['https://' + hostName + '/event2?originalUuid=' + uuid],
+      event_url: ['https://' + hostName + '/event2?original_uuid=' + uuid],
       event_method: 'POST'
       })
       .then(res => {
@@ -185,26 +210,51 @@ app.post('/event1', (req, res) => {
 
   //---------
 
-  if (req.body.status === 'completed') {
+  if (req.body.status == 'completed') {
 
     const firstLegUuid = req.body.uuid;
 
-    const secongLegUuid = app.get('second_leg_with_' + firstLegUuid);
+    const secondLegUuid = app.get('second_leg_with_' + firstLegUuid);
 
-    if (secongLegUuid != null) {  // if second leg has started
+    if (secondLegUuid != null) {  // if second leg has started and not yet terminated
 
-      vonage.voice.hangupCall(secongLegUuid)  // then terminate second call leg
-        .then(res => console.log('>>> terminated second call leg'))
-        .catch(err => {
-          console.error(`>>> terminating second call leg error - zone 1:`, err.response)
-          // you may see error 400 bad request if second leg is already terminated, that's not a problem
-        });
+      // get status of second call
+      // see https://nexmoinc.github.io/conversation-service-docs/docs/api/get-legs
+      const accessToken = tokenGenerate(appId, privateKey, {});
 
-      app.set('second_leg_with_' + firstLegUuid, null); // clear parameter 
+      await request.get(apiRegion + '/v1/legs/' + secondLegUuid, {
+          headers: {
+              'Authorization': 'Bearer ' + accessToken,
+              "content-type": "application/json",
+          },
+          json: true,
+        }, function (error, response, body) {
+          if (error) {
+            console.log('error getting second leg info', secondLegUuid, error.body);
+          }
+          else {
+            
+            console.log('>>> leg info', secondLegUuid, response.body.status);
+
+            if (response.body.status != "completed") {
+              // hang up call 2
+
+              console.log('>>> hang up second call', secondLegUuid);
+
+              vonage.voice.hangupCall(secondLegUuid)  // then terminate second call leg
+                .then(res => console.log('>>> terminated second call leg'))
+                .catch(err => {
+                  console.log(">>> terminating second call leg error", err)
+                  // you may see error 400 bad request if second leg is already terminated, that's not a problem
+                });
+            };
+
+          }
+      });
 
     } else {
 
-      console.log('>>> no second leg yet');
+      console.log('>>> no second leg yet associated to first leg:', firstLegUuid);
 
     }
 
@@ -214,16 +264,22 @@ app.post('/event1', (req, res) => {
 
 //-----
 
-app.get('/answer2', (req, res) => {
+app.get('/answer2', (req, res) => { 
+
+    const originalUuid = req.query.original_uuid;
+
+    // track call 2 uuid with call 1 uuid
+    // originalUuid --> call 1
+    // req.query.uuid --> call 2
+    app.set('second_leg_with_' + originalUuid, req.query.uuid);
 
     //-- put call 2 into same named conference --
-
     let nccoResponse = [
         {
           "action": "conversation",
           "endOnExit": true,
           "startOnEnter":true,
-          "name": "conference_" + req.query.originalUuid
+          "name": "conference_" + originalUuid
         }
       ];
 
@@ -237,48 +293,28 @@ app.post('/event2', (req, res) => {
 
     res.status(200).send('Ok');
 
-    if (req.body.type === 'transfer') {
+    if (req.body.type == 'transfer') {
 
-      const call1Uuid = req.query.originalUuid;  
+      const call1Uuid = req.query.original_uuid;  
 
       vonage.voice.stopStreamAudio(call1Uuid)
         .then(res => console.log(`>>> stop streaming ring back tone to call ${call1Uuid} status:`, res))
         .catch(err => {
-          console.error(`>>> stop streaming ring back tone to call ${call1Uuid} error:`, err.response);
-          // console.error(err.body);
+          console.log(`>>> stop streaming ring back tone to call ${call1Uuid} error:`, err.body);
         });
 
-      // test call state of call1Uuid
-
-      const accessToken = tokenGenerate(appId, privateKey, {});
-
-      // see https://nexmoinc.github.io/conversation-service-docs/docs/api/get-legs
-      request.get(apiRegion + '/v1/legs/' + call1Uuid, {
-          headers: {
-              'Authorization': 'Bearer ' + accessToken,
-              "content-type": "application/json",
-          },
-          json: true,
-        }, function (error, response, body) {
-          if (error) {
-            console.log('error get call leg', call1Uuid, 'status:', error);
-          }
-          else {
-            // console.log('get call leg', call1Uuid, ':', response.body.state.status);
-
-            if (response.body.state.status === 'completed') {  // if 1st call leg has terminated
-              vonage.voice.hangupCall(req.body.uuid)          // then terminate second call leg
-                .then(res => console.log('>>> terminated second call leg'))
-                  .catch(err => {
-                    console.error(`>>> terminating second call leg error - zone 2:`, err.response)
-                  });
-              }
-
-            }
-
-      });
-
     };
+
+    //---
+
+    if (req.body.status == 'completed') {
+
+      const originalUuid = req.query.original_uuid;
+      app.set('second_leg_with_' + originalUuid, null); // reset value
+
+    }  
+
+    //---------------
 
 });
 
@@ -310,6 +346,80 @@ app.get('/answer', (req, res) => {
 app.post('/event', (req, res) => {
 
   res.status(200).send('Ok');
+
+});
+
+//--------
+
+app.post('/rtc', async(req, res) => {
+
+  res.status(200).send('Ok');
+
+  switch (req.body.type) {
+
+    case "sip:answered": // leg answered 
+
+      if (req.body.body.channel.type == "phone") {
+
+        const uuid = req.body.body.channel.legs[0].leg_id;
+
+        //-- start "leg" recording --
+        // see https://nexmoinc.github.io/conversation-service-docs/docs/api/create-recording
+        const accessToken = tokenGenerate(appId, privateKey, {});
+
+        request.post(apiRegion + '/v1/legs/' + uuid + '/recording', {
+            headers: {
+                'Authorization': 'Bearer ' + accessToken,
+                "content-type": "application/json",
+            },
+            body: {
+              "split": true,
+              "streamed": true,
+              // "beep": true,
+              "public": true,
+              "validity_time": 7200,
+              "format": "mp3",
+              "transcription": {
+                "language":"en-US",
+                "sentiment_analysis": true
+              }
+            },
+            json: true,
+          }, function (error, response, body) {
+            if (error) {
+              console.log('error start recording leg:', error.body);
+            }
+            else {
+              console.log('start recording leg:', response.body);
+            }
+        });
+
+      }
+
+      break;
+
+    case "audio:record:done": // leg recording, get the audio file
+      console.log('\n>>> /rtc audio:record:done');
+      console.log('req.body.body.destination_url', req.body.body.destination_url);
+      console.log('req.body.body.recording_id', req.body.body.recording_id);
+
+      await vonageNr.voice.downloadRecording(req.body.body.destination_url, './post-call-data/' + req.body.body.recording_id + '_' + req.body.body.channel.id + '.mp3');
+  
+      break;
+
+    case "audio:transcribe:done": // leg recording, get the transcript
+      console.log('\n>>> /rtc audio:transcribe:done');
+      console.log('req.body.body.transcription_url', req.body.body.transcription_url);
+      console.log('req.body.body.recording_id', req.body.body.recording_id);
+
+      await vonageNr.voice.downloadTranscription(req.body.body.transcription_url, './post-call-data/' + req.body.body.recording_id + '.txt');  
+
+      break;      
+    
+    default:  
+      // do nothing
+
+  }
 
 });
 
